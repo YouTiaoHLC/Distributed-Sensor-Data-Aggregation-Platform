@@ -1,8 +1,0 @@
-error: failed to load manifest for workspace member `C:\Users\ASUS\Desktop\Course File\COMP2432 Operating System\Project\os_lib`
-referenced by workspace at `C:\Users\ASUS\Desktop\Course File\COMP2432 Operating System\Project\Cargo.toml`
-
-Caused by:
-  failed to read `C:\Users\ASUS\Desktop\Course File\COMP2432 Operating System\Project\os_lib\Cargo.toml`
-
-Caused by:
-  系统找不到指定的路径。 (os error 3)
