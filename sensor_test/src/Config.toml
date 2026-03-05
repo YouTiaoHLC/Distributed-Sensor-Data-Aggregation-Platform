@@ -1,0 +1,30 @@
+[[sensors]]
+type = "Thermometer"
+id = "thermo-1"
+rate = 10
+
+[[sensors]]
+type = "Thermometer" 
+id = "thermo-2"
+rate = 10
+
+[[sensors]]
+type = "Accelerometer"
+id = "accel-1"
+rate = 20
+
+[[sensors]]
+type = "Accelerometer"
+id = "accel-2"
+rate = 20
+
+[[sensors]]
+type = "ForceSensor"
+id = "force-1"
+rate = 15
+
+# 可以随便加，想加多少加多少
+[[sensors]]
+type = "Accelerometer"
+id = "accel-3"
+rate = 20

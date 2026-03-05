@@ -1,0 +1,11 @@
+[package]
+name = "sensor_test"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sensor_sim = { path = "../sensor_sim" }
+rand = "0.8"  # sensor_sim 依赖 rand
+[[bin]]
+name = "available_test"
+path = "src/bin/available_test.rs"
