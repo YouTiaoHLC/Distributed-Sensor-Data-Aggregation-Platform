@@ -38,6 +38,9 @@ impl Thermometer {
         let mut writer = self.writer.take().expect("start called twice");
         let rate_per_sec = self.rate_per_sec;
         let running = Arc::clone(&self.running);
+        ///////////////////////
+        let id = self.id.clone();  // 复制 ID 供线程使用
+        ///////////////////////
 
         // Implementation for starting data generation thread
         self.handle = Some(std::thread::spawn(move || {
@@ -49,7 +52,16 @@ impl Thermometer {
 
                 // Write reading to the queue
                 unsafe {
-                    writer.write(reading);
+                    //////////////////////////////////////////
+                    //////////////////////////////////////////
+                    // write 返回 true 表示覆盖了旧数据（缓冲区满）
+                    //////////////////////////////////////////
+                    /// ////////////////////////////
+                    /// //////////////////////////////////////////
+
+                    if writer.write(reading) {
+                        eprintln!("⚠️ 数据丢失！传感器 {} 内部缓冲区溢出", id);
+                    }
                 }
 
                 // Sleep according to rate_per_sec

@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 sensor_sim = { path = "../sensor_sim" }
+shared_global = { path = "../shared_global" } 
+buffer_manager = { path = "../buffer_manager" } 
 rand = "0.8"  # sensor_sim 依赖 rand
 [[bin]]
 name = "available_test"

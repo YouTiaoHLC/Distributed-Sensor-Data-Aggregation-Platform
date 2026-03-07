@@ -1,0 +1,10 @@
+[package]
+name = "tests"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sensor_sim = { path = "../sensor_sim" }
+shared_global = { path = "../shared_global" }
+buffer_manager = { path = "../buffer_manager" }  # 添加这一行！
+rand = "0.8"

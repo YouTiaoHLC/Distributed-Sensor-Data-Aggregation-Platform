@@ -1,0 +1,1 @@
+Suggesstion: 不同种类的sensor之间的命名ID不重复

@@ -1,0 +1,8 @@
+[package]
+name = "shared_global"
+version = "0.1.0"        # 直接指定版本，不用 workspace
+edition = "2021"         # 直接指定 edition
+
+[dependencies]
+lazy_static = "1.4.0"
+sensor_sim = { path = "../sensor_sim" }
