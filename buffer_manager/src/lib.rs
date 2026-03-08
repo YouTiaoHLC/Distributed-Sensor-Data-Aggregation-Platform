@@ -8,10 +8,10 @@ use std::sync::{
 use sensor_sim::traits::Sensor;
 use shared_global::SensorType;
 use shared_global::UnifiedReading;
-use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use std::time::Instant;
 /// 单线程版的通用缓冲区管理器，底层用 VecDeque 做环形队列。
 const CRITICAL: f64 = 0.2; // 马上要满
 const WARNING: f64 = 0.25; // 需要注意
@@ -21,11 +21,10 @@ pub struct BufferManager<T> {
     not_empty: Condvar,
     total_writes: AtomicUsize,
     total_reads: AtomicUsize,
-    peak_usage: AtomicUsize,
     overflow_warnings: AtomicUsize,
     running: AtomicBool,                 // 全局运行标志
     threads: Mutex<Vec<JoinHandle<()>>>, // 所有读取线程句柄
-    sensor_count: AtomicUsize,
+    start_time: Instant,
 }
 
 impl BufferManager<UnifiedReading> {
@@ -38,11 +37,10 @@ impl BufferManager<UnifiedReading> {
             not_empty: Condvar::new(),
             total_writes: AtomicUsize::new(0),
             total_reads: AtomicUsize::new(0),
-            peak_usage: AtomicUsize::new(0),
             overflow_warnings: AtomicUsize::new(0),
             running: AtomicBool::new(true),
             threads: Mutex::new(Vec::new()),
-            sensor_count: AtomicUsize::new(0),
+            start_time: Instant::now(),
         }
     }
 
@@ -56,10 +54,12 @@ impl BufferManager<UnifiedReading> {
         let buf = self.buffer.lock().unwrap();
         buf.len()
     }
-    pub fn register_sensor(self: &Arc<Self>, mut sensor: SensorType, rate: u32) {
-        self.sensor_count.fetch_add(1, Ordering::Relaxed);
+    pub fn register_sensor_algorithm(self: &Arc<Self>, mut sensor: SensorType, rate: u32) {
         let manager = self.clone();
         let handle = thread::spawn(move || {
+            // 在线程内记录该线程读取的总数（用于调试）
+            let mut thread_reads = 0;
+
             while manager.running.load(Ordering::Relaxed) {
                 // 获取当前传感器积压
                 let available = match &sensor {
@@ -93,6 +93,7 @@ impl BufferManager<UnifiedReading> {
                         };
                         if let Some(r) = reading {
                             batch.push(r);
+                            thread_reads += 1; // 记录读取数
                         }
                     }
                     // 批量推入缓冲区
@@ -109,16 +110,108 @@ impl BufferManager<UnifiedReading> {
                     thread::sleep(Duration::from_millis(1));
                 }
             }
-            // 线程退出前，手动停止传感器内部线程
+
+            // ===== 退出前：先停止生产，再清空积压 =====
+            // 1. 先停止传感器内部生产线程
+            match &mut sensor {
+                SensorType::Thermometer(t) => t.stop(),
+                SensorType::Accelerometer(a) => a.stop(),
+                SensorType::ForceSensor(f) => f.stop(),
+            }
+
+            // 2. 清空传感器内部缓冲区剩余数据
+            loop {
+                let available = match &sensor {
+                    SensorType::Thermometer(t) => t.available(),
+                    SensorType::Accelerometer(a) => a.available(),
+                    SensorType::ForceSensor(f) => f.available(),
+                };
+                if available == 0 {
+                    break;
+                }
+                let mut batch = Vec::with_capacity(available);
+                for _ in 0..available {
+                    if let Some(r) = match &sensor {
+                        SensorType::Thermometer(t) => t.read().map(UnifiedReading::Thermo),
+                        SensorType::Accelerometer(a) => a.read().map(UnifiedReading::Accel),
+                        SensorType::ForceSensor(f) => f.read().map(UnifiedReading::Force),
+                    } {
+                        batch.push(r);
+                        thread_reads += 1;
+                    }
+                }
+                if !batch.is_empty() {
+                    let (accepted, _rejected) = manager.push_batch(batch);
+                    if accepted < available {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+
+            // 调试打印：该线程总共读取了多少条
+            // println!("传感器线程退出，共读取 {} 条数据", thread_reads);
+        });
+
+        // 将句柄存入线程列表
+        self.threads.lock().unwrap().push(handle);
+    }
+    pub fn register_sensor(self: &Arc<Self>, mut sensor: SensorType, _rate: u32) {
+        let manager = self.clone();
+        let handle = thread::spawn(move || {
+            while manager.running.load(Ordering::Relaxed) {
+                // 不断读取直到缓冲区空或遇到错误
+                while let Some(reading) = match &sensor {
+                    SensorType::Thermometer(t) => t.read().map(UnifiedReading::Thermo),
+                    SensorType::Accelerometer(a) => a.read().map(UnifiedReading::Accel),
+                    SensorType::ForceSensor(f) => f.read().map(UnifiedReading::Force),
+                } {
+                    if manager.push(reading).is_err() {
+                        // 缓冲区满，短暂休眠后重试
+                        thread::sleep(Duration::from_millis(1));
+                        break;
+                    }
+                }
+                // 无数据或缓冲区满时短暂休眠
+                thread::sleep(Duration::from_millis(1));
+            }
+            // 停止传感器内部线程
             match &mut sensor {
                 SensorType::Thermometer(t) => t.stop(),
                 SensorType::Accelerometer(a) => a.stop(),
                 SensorType::ForceSensor(f) => f.stop(),
             }
         });
-
-        // 将句柄存入线程列表
         self.threads.lock().unwrap().push(handle);
+    }
+    pub fn print_stats(&self) {
+        let current_size = self.len();
+        let capacity = self.capacity();
+        let utilization = if capacity > 0 {
+            current_size as f64 / capacity as f64 * 100.0
+        } else {
+            0.0
+        };
+        let total_writes = self.total_writes.load(Ordering::Relaxed);
+        let total_reads = self.total_reads.load(Ordering::Relaxed);
+        let overflow_warnings = self.overflow_warnings.load(Ordering::Relaxed);
+        let thread_count = self.threads.lock().unwrap().len();
+
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        let write_rate = if elapsed > 0.0 {
+            total_writes as f64 / elapsed
+        } else {
+            0.0
+        };
+        let read_rate = if elapsed > 0.0 {
+            total_reads as f64 / elapsed
+        } else {
+            0.0
+        };
+
+        println!(
+            "📊 Buffer Stats: size={}/{}, util={:.1}%, writes={}, reads={}, write_rate={:.0}/s, read_rate={:.0}/s, warnings={}, threads={}",
+            current_size, capacity, utilization, total_writes, total_reads, write_rate, read_rate, overflow_warnings, thread_count
+        );
     }
     /// 优雅关闭所有读取线程
     pub fn shutdown(&self) {
@@ -163,12 +256,6 @@ impl BufferManager<UnifiedReading> {
         buf.push_back(item);
         let current_len = buf.len();
         self.total_writes.fetch_add(1, Ordering::Relaxed);
-
-        let previous_peak = self.peak_usage.load(Ordering::Relaxed);
-        if current_len > previous_peak {
-            self.peak_usage.store(current_len, Ordering::Relaxed);
-        }
-
         // 检查使用率是否超过 90%
         if current_len > current_cap * 90 / 100 {
             self.overflow_warnings.fetch_add(1, Ordering::Relaxed);
@@ -177,12 +264,15 @@ impl BufferManager<UnifiedReading> {
             //     current_len * 100 / current_cap,
             //     current_cap
             // );
-
-            // 获取当前运行的传感器数量（从全局注册表）
-            let sensor_count = self.sensor_count.load(Ordering::Relaxed);
-            const SENSOR_THRESHOLD: usize = 3; // 阈值可调整
-            if sensor_count > SENSOR_THRESHOLD {
-                let new_cap = current_cap + 100000;
+            let sensor_count = self.threads.lock().unwrap().len();
+            const SENSOR_LESS: usize = 3; // 阈值可调整
+            const SENSOR_MORE: usize = 150; 
+            if (sensor_count > SENSOR_LESS&&sensor_count<SENSOR_MORE) {
+                let new_cap = current_cap + 30000;
+                self.capacity.store(new_cap, Ordering::Relaxed);
+                // eprintln!("扩容：新容量 = {}", new_cap);
+            }else if sensor_count >= SENSOR_MORE {
+                let new_cap = current_cap + 80000;
                 self.capacity.store(new_cap, Ordering::Relaxed);
                 // eprintln!("扩容：新容量 = {}", new_cap);
             }
@@ -208,15 +298,10 @@ impl BufferManager<UnifiedReading> {
 
         // 更新统计信息
         let current_len = buf.len();
-        let previous_peak = self.peak_usage.load(Ordering::Relaxed);
-        if current_len > previous_peak {
-            self.peak_usage.store(current_len, Ordering::Relaxed);
-        }
-
         // 扩容检查（使用原子 sensor_count）
         if current_len > current_cap * 90 / 100 {
             self.overflow_warnings.fetch_add(1, Ordering::Relaxed);
-            let sensor_count = self.sensor_count.load(Ordering::Relaxed);
+            let sensor_count = self.threads.lock().unwrap().len();
             if sensor_count > 3 {
                 let new_cap = current_cap + 100000;
                 self.capacity.store(new_cap, Ordering::Relaxed);

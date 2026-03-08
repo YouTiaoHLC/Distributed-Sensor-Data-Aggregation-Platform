@@ -1,7 +1,7 @@
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
     thread::JoinHandle,
 };
@@ -40,7 +40,7 @@ impl Accelerometer {
         let rate_per_sec = self.rate_per_sec;
         let running = Arc::clone(&self.running);
         ///////////////////////
-        let id = self.id.clone();  // 复制 ID 供线程使用
+        let id = self.id.clone(); // 复制 ID 供线程使用
         ///////////////////////
 
         self.handle = Some(std::thread::spawn(move || {
@@ -51,6 +51,7 @@ impl Accelerometer {
                     acceleration_z: rand::random::<f32>() * 5.0,
                 };
 
+
                 unsafe {
                     //////////////////////////////////////////
                     //////////////////////////////////////////
@@ -58,15 +59,12 @@ impl Accelerometer {
                     //////////////////////////////////////////
                     /// ////////////////////////////
                     /// //////////////////////////////////////////
-
                     if writer.write(reading) {
                         eprintln!("⚠️ 数据丢失！传感器 {} 内部缓冲区溢出", id);
                     }
                 }
 
-                std::thread::sleep(std::time::Duration::from_millis(
-                    1000 / rate_per_sec as u64,
-                ));
+                std::thread::sleep(std::time::Duration::from_millis(1000 / rate_per_sec as u64));
             }
             writer
         }));

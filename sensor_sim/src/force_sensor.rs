@@ -39,8 +39,8 @@ impl ForceSensor {
         let mut writer = self.writer.take().expect("start called twice");
         let rate_per_sec = self.rate_per_sec;
         let running = Arc::clone(&self.running);
-///////////////////////////////
-        let id = self.id.clone();  // 复制 ID 供线程使用
+        ///////////////////////////////
+        let id = self.id.clone(); // 复制 ID 供线程使用
         ///////////////////////
         self.handle = Some(std::thread::spawn(move || {
             while running.load(Ordering::Relaxed) {
@@ -49,7 +49,6 @@ impl ForceSensor {
                     force_y: rand::random::<f32>() * 100.0,
                     force_z: rand::random::<f32>() * 100.0,
                 };
-
                 unsafe {
                     //////////////////////////////////////////
                     //////////////////////////////////////////
@@ -57,7 +56,6 @@ impl ForceSensor {
                     //////////////////////////////////////////
                     /// ////////////////////////////
                     /// //////////////////////////////////////////
-
                     if writer.write(reading) {
                         eprintln!("⚠️ 数据丢失！传感器 {} 内部缓冲区溢出", id);
                     }
@@ -65,6 +63,7 @@ impl ForceSensor {
 
                 std::thread::sleep(std::time::Duration::from_millis(1000 / rate_per_sec as u64));
             }
+    
             writer
         }));
     }
