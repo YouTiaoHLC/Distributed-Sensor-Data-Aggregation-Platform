@@ -1,0 +1,8 @@
+[package]
+name = "buffer_manager"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sensor_sim = { path = "../sensor_sim" }
+shared_global = { path = "../shared_global" } 
