@@ -10,104 +10,196 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
-fn main() {
-    let mut rng = rand::thread_rng();
-    let buffer = Arc::new(BufferManager::<UnifiedReading>::new(30000));
-    // 1. 创建、启动并注册传感器
-    let start_time = Instant::now();
-    const SIZE: i32 = 550;
-    let mut rate = 1000;
-    for i in 0..SIZE {
-        let sensor_type = rng.gen_range(0..3);
-        // rate = rng.gen_range(100..1001);
-        let id = format!("sensor-{}", i);
+use std::process::{Command, Stdio,Child};
+use std::io::{BufRead, BufReader};
+use std::sync::atomic::Ordering;
 
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "--child" {
+        // ---------- 子进程模式：运行传感器并输出数据 ----------
+        if args.len() < 5 {
+            eprintln!("子进程参数不足");
+            return;
+        }
+        let sensor_type: u32 = args[2].parse().unwrap();
+        let id = args[3].clone();
+        let rate: u32 = args[4].parse().unwrap();
+
+        // 先发送一次速率信息
+        //println!("RATE,{}", rate);
+        const ENABLE_ALGORITHM: bool = true; // 改为 false 即可关闭算法
+        // 创建传感器
+        let child_start = Instant::now();
+        //对比试验
+        let enable_algorithm =ENABLE_ALGORITHM;
         match sensor_type {
             0 => {
-                let mut thermo = Thermometer::new(id.clone(), rate);
+                let mut thermo = Thermometer::new(id, rate);
                 thermo.start();
-                buffer.register_sensor(SensorType::Thermometer(thermo), rate);
+                if enable_algorithm {
+                    println!("RATE,{}", rate);
+                }
+                let mut last_avail_send = Instant::now();
+                while child_start.elapsed() < Duration::from_secs(5) {
+                    if let Some(reading) = thermo.read() {
+                        println!("T,{}", reading.temperature_celsius);
+                    }
+                    if enable_algorithm && last_avail_send.elapsed() >= Duration::from_millis(100) {
+                        let avail = thermo.available();
+                        println!("AVAIL,{}", avail);
+                        last_avail_send = Instant::now();
+                    }
+                    thread::sleep(Duration::from_micros(100));
+                }
             }
             1 => {
-                let mut accel = Accelerometer::new(id.clone(), rate);
+                let mut accel = Accelerometer::new(id, rate);
                 accel.start();
-                buffer.register_sensor(SensorType::Accelerometer(accel), rate);
+                if enable_algorithm {
+                    println!("RATE,{}", rate);
+                }
+                let mut last_avail_send = Instant::now();
+                let mut count = 0;
+                while child_start.elapsed() < Duration::from_secs(5) {
+                    if let Some(reading) = accel.read() {
+                        println!("A,{},{},{}", reading.acceleration_x, reading.acceleration_y, reading.acceleration_z);
+                    count+=1
+                    }
+                    if enable_algorithm && last_avail_send.elapsed() >= Duration::from_millis(100) {
+                        let avail = accel.available();
+                        println!("AVAIL,{}", avail);
+                        last_avail_send = Instant::now();
+                    }
+                }
+                eprintln!("子进程  读取了 {} 条数据", count);
             }
             2 => {
-                let mut force = ForceSensor::new(id.clone(), rate);
+                let mut force = ForceSensor::new(id, rate);
                 force.start();
-                buffer.register_sensor(SensorType::ForceSensor(force), rate);
+                if enable_algorithm {
+                    println!("RATE,{}", rate);
+                }
+                let mut last_avail_send = Instant::now();
+                while child_start.elapsed() < Duration::from_secs(5) {
+                    if let Some(reading) = force.read() {
+                        println!("F,{},{},{}", reading.force_x, reading.force_y, reading.force_z);
+                    }
+                    if enable_algorithm && last_avail_send.elapsed() >= Duration::from_millis(100) {
+                        let avail = force.available();
+                        println!("AVAIL,{}", avail);
+                        last_avail_send = Instant::now();
+                    }
+                }
             }
-            _ => unreachable!(),
+            _ => panic!("未知传感器类型"),
         }
+        // match sensor_type {
+        //     0 => {
+        //         let mut thermo = Thermometer::new(id, rate);
+        //         thermo.start();
+        //         let mut last_avail_send = Instant::now();
+        //         while child_start.elapsed() < Duration::from_secs(5) {
+        //             if let Some(reading) = thermo.read() {
+        //                 println!("T,{}",  reading.temperature_celsius);
+        //             }
+        //             // 每100ms发送一次available
+        //             if last_avail_send.elapsed() >= Duration::from_millis(100) {
+        //                 let avail = thermo.available();
+        //                 println!("AVAIL,{}", avail);
+        //                 last_avail_send = Instant::now();
+        //             }
+        //             }
+        //         }
+        //
+        //     1 => {
+        //         let mut accel = Accelerometer::new(id, rate);
+        //         accel.start();
+        //         let mut last_avail_send = Instant::now();
+        //         while child_start.elapsed() < Duration::from_secs(5) {
+        //             if let Some(reading) = accel.read() {
+        //                 println!("A,{},{},{}", reading.acceleration_x, reading.acceleration_y, reading.acceleration_z);
+        //             }
+        //             if last_avail_send.elapsed() >= Duration::from_millis(100) {
+        //                 let avail = accel.available();
+        //                 println!("AVAIL,{}", avail);
+        //                 last_avail_send = Instant::now();
+        //             }
+        //
+        //         }
+        //     }
+        //     2 => {
+        //         let mut force = ForceSensor::new(id, rate);
+        //         force.start();
+        //         let mut last_avail_send = Instant::now();
+        //         while child_start.elapsed() < Duration::from_secs(5) {
+        //             if let Some(reading) = force.read() {
+        //                 println!("F,{},{},{}", reading.force_x, reading.force_y, reading.force_z);
+        //             }
+        //             if last_avail_send.elapsed() >= Duration::from_millis(100) {
+        //                 let avail = force.available();
+        //                 println!("AVAIL,{}", avail);
+        //                 last_avail_send = Instant::now();
+        //             }
+        //
+        //         }
+        //     }
+        //     _ => panic!("未知传感器类型"),
+        // }
+        return;
     }
-    let mut elapsed = start_time.elapsed();
-    println!("创建sensor用时: {:?}", elapsed);
-    // 4. 主线程监控
-    let buffer_clone = buffer.clone();
 
-    // let sampler = thread::spawn(move || {
-    //     let mut sampled = 0;
-    //     let max_samples = 3;
-    //     while sampled < max_samples {
-    //         thread::sleep(Duration::from_secs(2)); // 每2秒抽样一次
-    //         // 尝试弹出数据（非阻塞）
-    //         match buffer_clone.try_pop() {
-    //             Some(reading) => {
-    //                 sampled += 1;
-    //                 // 根据类型验证数据有效性
-    //                 match reading {
-    //                     UnifiedReading::Thermo(t) => {
-    //                         println!("✅ 抽样温度: {:.2}°C", t.temperature_celsius);
-    //                         // 验证温度范围 (20-30 是合理的随机范围)
-    //                         assert!(t.temperature_celsius >= 20.0 && t.temperature_celsius <= 30.0);
-    //                     }
-    //                     UnifiedReading::Accel(a) => {
-    //                         println!("✅ 抽样加速度: x={:.2}, y={:.2}, z={:.2}",
-    //                             a.acceleration_x, a.acceleration_y, a.acceleration_z);
-    //                         // 加速度范围 ±5
-    //                         assert!(a.acceleration_x.abs() <= 5.0);
-    //                         assert!(a.acceleration_y.abs() <= 5.0);
-    //                         assert!(a.acceleration_z.abs() <= 5.0);
-    //                     }
-    //                     UnifiedReading::Force(f) => {
-    //                         println!("✅ 抽样力: x={:.2}, y={:.2}, z={:.2}",
-    //                             f.force_x, f.force_y, f.force_z);
-    //                         // 力范围 0-100
-    //                         assert!(f.force_x >= 0.0 && f.force_x <= 100.0);
-    //                         assert!(f.force_y >= 0.0 && f.force_y <= 100.0);
-    //                         assert!(f.force_z >= 0.0 && f.force_z <= 100.0);
-    //                     }
-    //                 }
-    //             }
-    //             None => {
-    //                 println!("⏳ 缓冲区暂无数据，等待...");
-    //             }
-    //         }
-    //     }
-    //     println!("📊 抽样完成，共检查 {} 个样本", max_samples);
-    // });
+    // ---------- 父进程模式：启动多个子进程并读取数据 ----------
+    let buffer = Arc::new(BufferManager::<UnifiedReading>::new(30000));
+    let start_time = Instant::now();
 
-    // 5. 主线程监控
-    // 运行一段时间后退出（避免无限运行）
-    let monitor_duration = Duration::from_secs(5);
-    let start = std::time::Instant::now();
+    // 启动子进程
+    let mut children: Vec<Child> = vec![];
+    for i in 0..100 { // 启动100个子进程
+        let sensor_type = rand::thread_rng().gen_range(0..3);
+        let rate = 100;
+        let id = format!("sensor-{}", i);
+        let exe = std::env::current_exe().unwrap();
 
-    while start.elapsed() < monitor_duration {
-        thread::sleep(Duration::from_secs(1));
-        println!("缓冲区大小: {}", buffer.len());
+        let mut child = Command::new(exe)
+            .arg("--child")
+            .arg(sensor_type.to_string())
+            .arg(id.clone())
+            .arg(rate.to_string())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("启动子进程失败");
+
+        let stdout = child.stdout.take().unwrap();
+        buffer.register_pipe_reader(id, stdout);
+        children.push(child);
     }
-    elapsed = start_time.elapsed();
-    println!("shutdown前实际运行时间: {:?}", elapsed);
+    let ready_time = Instant::now();
+    println!("子进程启动耗时: {:?}", ready_time.duration_since(start_time));
+    let writes_before = buffer.total_writes.load(Ordering::Relaxed);
+
+    // 正式运行5秒
+    let run_start = Instant::now();
+    thread::sleep(Duration::from_secs(5));
+    let run_end = Instant::now();
+    let run_duration = run_end.duration_since(run_start);
+    println!("实际运行时间: {:?} (期望5秒)", run_duration);
+    // 记录运行开始前的写入数
+    // 记录运行结束后的写入数
+    let writes_after = buffer.total_writes.load(Ordering::Relaxed);
+    let writes_in_run = writes_after - writes_before;
+    let run_rate = writes_in_run as f64 / run_duration.as_secs_f64();
+    println!("运行期间写入数: {}, 速率: {:.0}/s", writes_in_run, run_rate);
+
+    // 等待子进程和关闭（原代码）
+    thread::sleep(Duration::from_millis(500));
+    for mut child in children {
+        let _ = child.wait();
+    }
+    let shutdown_end = Instant::now();
+    println!("总耗时: {:?}", shutdown_end.duration_since(start_time));
+
+    // 打印统计信息
     buffer.print_stats();
-    let shutdown = Instant::now();
-    buffer.shutdown();
-    println!("缓冲区大小: {}", buffer.len());
-    // 等待抽样线程完成（它应该已经在 max_samples 后结束）
-    // sampler.join().unwrap();
-    elapsed = start_time.elapsed();
-    println!("实际运行总时间: {:?}", elapsed);
-    let mut t1=shutdown.elapsed();
-    println!("关闭耗时：{:?}",t1);
-    println!("✅ 测试完成");
+    println!("父进程结束，缓冲区大小: {}", buffer.len());
 }
