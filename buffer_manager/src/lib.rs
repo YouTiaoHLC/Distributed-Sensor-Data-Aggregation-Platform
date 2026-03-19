@@ -1,34 +1,51 @@
 use shared_global;
 use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::sync::{
     Arc, Condvar, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
-// use std::fmt;
 use sensor_sim::traits::Sensor;
+use sensor_sim::thermometer::ThermoReading;
+use sensor_sim::accelerometer::AccelReading;
+use sensor_sim::force_sensor::ForceReading;
 use shared_global::SensorType;
 use shared_global::UnifiedReading;
 use std::sync::atomic::AtomicBool;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use std::time::Instant;
-/// 单线程版的通用缓冲区管理器，底层用 VecDeque 做环形队列。
-const CRITICAL: f64 = 0.2; // 马上要满
-const WARNING: f64 = 0.25; // 需要注意
+use std::io::{BufRead, BufReader, Read};
+
+const CRITICAL: f64 = 0.2;
+const WARNING: f64 = 0.25;
+
+/// Sensor statistics for a single sensor.
+#[derive(Debug, Clone)]
+struct SensorStats {
+    rate: u32,
+    last_available: usize,
+}
+
+/// A bounded buffer manager that stores sensor readings and provides
+/// concurrent access for multiple producer threads (via push) and a single
+/// consumer (via pop). It supports dynamic capacity expansion under high load.
 pub struct BufferManager<T> {
     buffer: Mutex<VecDeque<T>>,
     capacity: AtomicUsize,
     not_empty: Condvar,
-    total_writes: AtomicUsize,
+    pub total_writes: AtomicUsize,
     total_reads: AtomicUsize,
     overflow_warnings: AtomicUsize,
-    running: AtomicBool,                 // 全局运行标志
-    threads: Mutex<Vec<JoinHandle<()>>>, // 所有读取线程句柄
+    running: AtomicBool,
+    threads: Mutex<Vec<JoinHandle<()>>>,
     start_time: Instant,
+    sensor_stats: Mutex<HashMap<String, SensorStats>>, // Maps sensor id to its latest stats
+    sensor_rates: Mutex<HashMap<String, u32>>,         // Maps sensor id to its configured rate
 }
 
 impl BufferManager<UnifiedReading> {
-    /// 创建一个新的 BufferManager，指定容量上限。
+    /// Creates a new `BufferManager` with the given initial capacity.
     pub fn new(capacity: usize) -> Self {
         assert!(capacity > 0, "capacity must be > 0");
         Self {
@@ -41,148 +58,193 @@ impl BufferManager<UnifiedReading> {
             running: AtomicBool::new(true),
             threads: Mutex::new(Vec::new()),
             start_time: Instant::now(),
+            sensor_stats: Mutex::new(HashMap::new()),
+            sensor_rates: Mutex::new(HashMap::new()),
         }
     }
 
-    /// 返回缓冲区容量（最大可存放的元素数）。
+    /// Returns the current capacity of the buffer.
     pub fn capacity(&self) -> usize {
         self.capacity.load(Ordering::Relaxed)
     }
 
-    /// 当前已使用的槽位数量。
+    /// Returns the current number of elements in the buffer.
     pub fn len(&self) -> usize {
         let buf = self.buffer.lock().unwrap();
         buf.len()
     }
-    pub fn register_sensor_algorithm(self: &Arc<Self>, mut sensor: SensorType, rate: u32) {
+
+    /// Registers a new pipe reader thread that reads lines from a child process's stdout.
+    ///
+    /// This method spawns a thread that continuously reads lines from the provided `reader`
+    /// (typically a pipe from a child process). Lines are expected to follow a simple protocol:
+    /// - `RATE,<rate>`: informs the buffer of the sensor's sampling rate.
+    /// - `AVAIL,<available>`: reports the sensor's internal queue occupancy.
+    /// - `T,<value>`: temperature reading.
+    /// - `A,<x>,<y>,<z>`: accelerometer reading.
+    /// - `F,<x>,<y>,<z>`: force sensor reading.
+    ///
+    /// The thread accumulates readings into batches (only for efficiency of parsing, not for
+    /// batch pushing) and pushes them one by one using `push()`. The batch size is dynamically
+    /// adjusted based on the sensor's reported available space.
+    ///
+    /// # Arguments
+    /// * `sensor_id` - A unique identifier for the sensor (used for statistics).
+    /// * `reader` - An object implementing `Read + Send + 'static`, typically the stdout of a child process.
+    pub fn register_pipe_reader<R: Read + Send + 'static>(
+        self: &Arc<Self>,
+        sensor_id: String,
+        reader: R,
+    ) {
         let manager = self.clone();
         let handle = thread::spawn(move || {
-            // 在线程内记录该线程读取的总数（用于调试）
-            let mut thread_reads = 0;
+            let buf_reader = BufReader::new(reader);
+            let mut local_buffer = Vec::with_capacity(100); // Local batch buffer
+            let mut batch_size = 20; // Default batch size
+            let mut rate = 0; // Sensor rate (optional, not currently used)
 
-            while manager.running.load(Ordering::Relaxed) {
-                // 获取当前传感器积压
-                let available = match &sensor {
-                    SensorType::Thermometer(t) => t.available(),
-                    SensorType::Accelerometer(a) => a.available(),
-                    SensorType::ForceSensor(f) => f.available(),
-                };
-                let emergency = (127 - available) as f64 / rate as f64; // 剩余时间
-
-                // 根据紧急程度调整睡眠时间和本次最大读取量
-                let (sleep_duration, max_batch) = if emergency < CRITICAL {
-                    (Duration::from_micros(100), 40)
-                } else if emergency < WARNING {
-                    (Duration::from_millis(1), 10)
-                } else {
-                    (Duration::from_millis(5), 5)
-                };
-
-                // 先休眠（让出CPU），然后再读取
-                thread::sleep(sleep_duration);
-
-                // 确定本次实际要读取的数量
-                let to_read = available.min(max_batch);
-                if to_read > 0 {
-                    let mut batch = Vec::with_capacity(to_read as usize);
-                    for _ in 0..to_read {
-                        let reading = match &sensor {
-                            SensorType::Thermometer(t) => t.read().map(UnifiedReading::Thermo),
-                            SensorType::Accelerometer(a) => a.read().map(UnifiedReading::Accel),
-                            SensorType::ForceSensor(f) => f.read().map(UnifiedReading::Force),
-                        };
-                        if let Some(r) = reading {
-                            batch.push(r);
-                            thread_reads += 1; // 记录读取数
-                        }
-                    }
-                    // 批量推入缓冲区
-                    if !batch.is_empty() {
-                        let (accepted, rejected) = manager.push_batch(batch);
-                        if !rejected.is_empty() {
-                            // 缓冲区满了，被拒绝的数据可以稍后重试
-                            thread::sleep(Duration::from_millis(1));
-                            // 可选：将 rejected 重新放入下次批次
-                        }
-                    }
-                } else {
-                    // 无数据时短暂休眠
-                    thread::sleep(Duration::from_millis(1));
-                }
-            }
-
-            // ===== 退出前：先停止生产，再清空积压 =====
-            // 1. 先停止传感器内部生产线程
-            match &mut sensor {
-                SensorType::Thermometer(t) => t.stop(),
-                SensorType::Accelerometer(a) => a.stop(),
-                SensorType::ForceSensor(f) => f.stop(),
-            }
-
-            // 2. 清空传感器内部缓冲区剩余数据
-            loop {
-                let available = match &sensor {
-                    SensorType::Thermometer(t) => t.available(),
-                    SensorType::Accelerometer(a) => a.available(),
-                    SensorType::ForceSensor(f) => f.available(),
-                };
-                if available == 0 {
-                    break;
-                }
-                let mut batch = Vec::with_capacity(available);
-                for _ in 0..available {
-                    if let Some(r) = match &sensor {
-                        SensorType::Thermometer(t) => t.read().map(UnifiedReading::Thermo),
-                        SensorType::Accelerometer(a) => a.read().map(UnifiedReading::Accel),
-                        SensorType::ForceSensor(f) => f.read().map(UnifiedReading::Force),
-                    } {
-                        batch.push(r);
-                        thread_reads += 1;
-                    }
-                }
-                if !batch.is_empty() {
-                    let (accepted, _rejected) = manager.push_batch(batch);
-                    if accepted < available {
-                        thread::sleep(Duration::from_millis(1));
-                    }
-                }
-            }
-
-            // 调试打印：该线程总共读取了多少条
-            // println!("传感器线程退出，共读取 {} 条数据", thread_reads);
-        });
-
-        // 将句柄存入线程列表
-        self.threads.lock().unwrap().push(handle);
-    }
-    pub fn register_sensor(self: &Arc<Self>, mut sensor: SensorType, _rate: u32) {
-        let manager = self.clone();
-        let handle = thread::spawn(move || {
-            while manager.running.load(Ordering::Relaxed) {
-                // 不断读取直到缓冲区空或遇到错误
-                while let Some(reading) = match &sensor {
-                    SensorType::Thermometer(t) => t.read().map(UnifiedReading::Thermo),
-                    SensorType::Accelerometer(a) => a.read().map(UnifiedReading::Accel),
-                    SensorType::ForceSensor(f) => f.read().map(UnifiedReading::Force),
-                } {
-                    if manager.push(reading).is_err() {
-                        // 缓冲区满，短暂休眠后重试
-                        thread::sleep(Duration::from_millis(1));
+            for line in buf_reader.lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("Error reading pipe: {}", e);
                         break;
                     }
+                };
+                let parts: Vec<&str> = line.split(',').collect();
+                if parts.is_empty() {
+                    continue;
                 }
-                // 无数据或缓冲区满时短暂休眠
-                thread::sleep(Duration::from_millis(1));
+                match parts[0] {
+                    "RATE" => {
+                        if parts.len() == 2 {
+                            rate = parts[1].parse().unwrap_or(0);
+                            let mut rates = manager.sensor_rates.lock().unwrap();
+                            rates.insert(sensor_id.clone(), rate);
+                        }
+                    }
+                    "AVAIL" => {
+                        if parts.len() == 2 {
+                            let avail: usize = parts[1].parse().unwrap_or(0);
+                            // Dynamically adjust batch size based on available space
+                            // Assume sensor internal queue capacity is 128
+                            let new_batch_size = if avail < 20 {
+                                80  // Urgent: little free space, read many
+                            } else if avail < 50 {
+                                40  // Medium
+                            } else {
+                                20  // Normal
+                            };
+                            if new_batch_size != batch_size {
+                                batch_size = new_batch_size;
+                                // Ensure local buffer capacity is sufficient
+                                if local_buffer.capacity() < batch_size {
+                                    local_buffer.reserve(batch_size - local_buffer.capacity());
+                                }
+                            }
+                        }
+                    }
+                    "T" => {
+                        if parts.len() == 2 {
+                            let val: f32 = parts[1].parse().unwrap_or(0.0);
+                            let reading = UnifiedReading::Thermo(ThermoReading {
+                                temperature_celsius: val,
+                            });
+                            local_buffer.push(reading);
+                        }
+                    }
+                    "A" => {
+                        if parts.len() == 4 {
+                            let x: f32 = parts[1].parse().unwrap_or(0.0);
+                            let y: f32 = parts[2].parse().unwrap_or(0.0);
+                            let z: f32 = parts[3].parse().unwrap_or(0.0);
+                            let reading = UnifiedReading::Accel(AccelReading {
+                                acceleration_x: x,
+                                acceleration_y: y,
+                                acceleration_z: z,
+                            });
+                            local_buffer.push(reading);
+                        }
+                    }
+                    "F" => {
+                        if parts.len() == 4 {
+                            let x: f32 = parts[1].parse().unwrap_or(0.0);
+                            let y: f32 = parts[2].parse().unwrap_or(0.0);
+                            let z: f32 = parts[3].parse().unwrap_or(0.0);
+                            let reading = UnifiedReading::Force(ForceReading {
+                                force_x: x,
+                                force_y: y,
+                                force_z: z,
+                            });
+                            local_buffer.push(reading);
+                        }
+                    }
+                    _ => {}
+                }
+
+                // If local buffer has reached batch size, push items one by one
+                if local_buffer.len() >= batch_size {
+                    let mut rejected_count = 0;
+                    for item in local_buffer.drain(..) {
+                        if let Err(item) = manager.push(item) {
+                            // Buffer full, count as rejected and discard (no retry)
+                            rejected_count += 1;
+                        }
+                    }
+                    if rejected_count > 0 {
+                        eprintln!("Buffer full, dropped {} readings", rejected_count);
+                    }
+                    // Reallocate with capacity = batch_size to avoid frequent resizing
+                    local_buffer = Vec::with_capacity(batch_size);
+                }
             }
-            // 停止传感器内部线程
-            match &mut sensor {
-                SensorType::Thermometer(t) => t.stop(),
-                SensorType::Accelerometer(a) => a.stop(),
-                SensorType::ForceSensor(f) => f.stop(),
+
+            // Thread ending: push any remaining data one by one
+            if !local_buffer.is_empty() {
+                let mut rejected_count = 0;
+                for item in local_buffer.drain(..) {
+                    if let Err(item) = manager.push(item) {
+                        rejected_count += 1;
+                    }
+                }
+                if rejected_count > 0 {
+                    eprintln!("Buffer full, dropped {} readings", rejected_count);
+                }
             }
         });
         self.threads.lock().unwrap().push(handle);
     }
+
+    /// Returns the estimated emergency time (in seconds) for a given sensor.
+    ///
+    /// Emergency is defined as `(127 - last_available) / rate`, representing the time
+    /// until the sensor's internal queue becomes full. Returns `None` if the sensor is
+    /// unknown.
+    pub fn get_emergency(&self, sensor_id: &str) -> Option<f64> {
+        let stats_map = self.sensor_stats.lock().unwrap();
+        stats_map.get(sensor_id).map(|s| {
+            if s.rate == 0 {
+                f64::INFINITY
+            } else {
+                (127 - s.last_available) as f64 / s.rate as f64
+            }
+        })
+    }
+
+    /// Prints emergency levels for all registered sensors (for debugging).
+    pub fn print_all_emergencies(&self) {
+        let stats_map = self.sensor_stats.lock().unwrap();
+        for (id, stat) in stats_map.iter() {
+            let emergency = if stat.rate == 0 {
+                f64::INFINITY
+            } else {
+                (127 - stat.last_available) as f64 / stat.rate as f64
+            };
+            println!("Sensor {}: rate={}, avail={}, emergency={:.3}s", id, stat.rate, stat.last_available, emergency);
+        }
+    }
+
+    /// Prints statistics about the buffer (size, writes, reads, rates, warnings, threads).
     pub fn print_stats(&self) {
         let current_size = self.len();
         let capacity = self.capacity();
@@ -209,45 +271,54 @@ impl BufferManager<UnifiedReading> {
         };
 
         println!(
-            "📊 Buffer Stats: size={}/{}, util={:.1}%, writes={}, reads={}, write_rate={:.0}/s, read_rate={:.0}/s, warnings={}, threads={}",
-            current_size, capacity, utilization, total_writes, total_reads, write_rate, read_rate, overflow_warnings, thread_count
+            "Buffer Stats: size={}/{}, util={:.1}%, writes={}, reads={}, write_rate={:.0}/s, read_rate={:.0}/s, warnings={}, threads={}",
+            current_size,
+            capacity,
+            utilization,
+            total_writes,
+            total_reads,
+            write_rate,
+            read_rate,
+            overflow_warnings,
+            thread_count
         );
     }
-    /// 优雅关闭所有读取线程
+
+    /// Shuts down all background threads (both pipe readers and sensor algorithm threads).
+    /// Waits for them to finish.
     pub fn shutdown(&self) {
         self.running.store(false, Ordering::Relaxed);
 
-        // 先取出所有句柄，然后释放锁
+        // Take all handles out of the mutex
         let handles = {
             let mut threads = self.threads.lock().unwrap();
             threads.drain(..).collect::<Vec<_>>()
-        }; // 锁在这里自动释放
+        };
 
-        // 此时锁已释放，可以安全地等待
+        // Now lock is released, we can safely join
         for handle in handles {
-            thread::sleep(Duration::from_millis(1)); // 给线程一点退出时间
+            thread::sleep(Duration::from_millis(1)); // Give threads a moment to exit
             if let Err(e) = handle.join() {
-                eprintln!("线程 join 失败: {:?}", e);
+                eprintln!("Thread join failed: {:?}", e);
             }
         }
     }
-    /// 缓冲区是否为空。
+
+    /// Returns `true` if the buffer is empty.
     pub fn is_empty(&self) -> bool {
         let buf = self.buffer.lock().unwrap();
         buf.is_empty()
     }
 
-    /// 缓冲区是否已满。
+    /// Returns `true` if the buffer is full (size >= capacity).
     pub fn is_full(&self) -> bool {
         let buf = self.buffer.lock().unwrap();
         buf.len() >= self.capacity.load(Ordering::Relaxed)
     }
 
-    /// 尝试向缓冲区写入一个元素。
-    /// - 如果未满，push 成功，返回 Ok(())。
-
+    /// Attempts to push a single item into the buffer.
+    /// Returns `Ok(())` on success, or `Err(item)` if the buffer is full.
     pub fn push(&self, item: UnifiedReading) -> Result<(), UnifiedReading> {
-        // 1. 获取锁
         let mut buf = self.buffer.lock().unwrap();
         let current_cap = self.capacity.load(Ordering::Relaxed);
         if buf.len() >= current_cap {
@@ -256,69 +327,29 @@ impl BufferManager<UnifiedReading> {
         buf.push_back(item);
         let current_len = buf.len();
         self.total_writes.fetch_add(1, Ordering::Relaxed);
-        // 检查使用率是否超过 90%
+        // Check if utilization exceeds 90%
         if current_len > current_cap * 90 / 100 {
             self.overflow_warnings.fetch_add(1, Ordering::Relaxed);
-            // eprintln!(
-            //     "Warning：缓冲区使用率 {}% (容量: {})",
-            //     current_len * 100 / current_cap,
-            //     current_cap
-            // );
             let sensor_count = self.threads.lock().unwrap().len();
-            const SENSOR_LESS: usize = 3; // 阈值可调整
-            const SENSOR_MORE: usize = 150; 
-            if (sensor_count > SENSOR_LESS&&sensor_count<SENSOR_MORE) {
+            const SENSOR_LESS: usize = 3;
+            const SENSOR_MORE: usize = 150;
+            if sensor_count > SENSOR_LESS && sensor_count < SENSOR_MORE {
                 let new_cap = current_cap + 30000;
                 self.capacity.store(new_cap, Ordering::Relaxed);
-                // eprintln!("扩容：新容量 = {}", new_cap);
-            }else if sensor_count >= SENSOR_MORE {
+            } else if sensor_count >= SENSOR_MORE {
                 let new_cap = current_cap + 80000;
                 self.capacity.store(new_cap, Ordering::Relaxed);
-                // eprintln!("扩容：新容量 = {}", new_cap);
             }
         }
         self.not_empty.notify_one();
         Ok(())
     }
-    pub fn push_batch(&self, items: Vec<UnifiedReading>) -> (usize, Vec<UnifiedReading>) {
-        let mut buf = self.buffer.lock().unwrap(); // 只锁一次
-        let current_cap = self.capacity.load(Ordering::Relaxed);
-        let mut accepted = 0;
-        let mut rejected = Vec::new();
 
-        for item in items {
-            if buf.len() >= current_cap {
-                rejected.push(item);
-            } else {
-                buf.push_back(item);
-                accepted += 1;
-                self.total_writes.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        // 更新统计信息
-        let current_len = buf.len();
-        // 扩容检查（使用原子 sensor_count）
-        if current_len > current_cap * 90 / 100 {
-            self.overflow_warnings.fetch_add(1, Ordering::Relaxed);
-            let sensor_count = self.threads.lock().unwrap().len();
-            if sensor_count > 3 {
-                let new_cap = current_cap + 100000;
-                self.capacity.store(new_cap, Ordering::Relaxed);
-            }
-        }
-
-        // 如果有数据写入，通知等待的读者
-        if accepted > 0 {
-            self.not_empty.notify_all(); // 可唤醒所有等待者
-        }
-
-        (accepted, rejected)
-    }
+    /// Blocks until an item is available, then returns it.
     pub fn pop(&self) -> UnifiedReading {
         let mut buf = self.buffer.lock().unwrap();
 
-        // 当缓冲区空时，阻塞等待
+        // Wait while buffer is empty
         while buf.is_empty() {
             buf = self.not_empty.wait(buf).unwrap();
         }
@@ -328,23 +359,48 @@ impl BufferManager<UnifiedReading> {
 
         item
     }
+
+    /// Attempts to pop an item, blocking for at most `timeout`.
+    /// Returns `None` if the timeout expires and no item is available.
     pub fn pop_timeout(&self, timeout: Duration) -> Option<UnifiedReading> {
-        let mut buf = self.buffer.lock().unwrap();
-        if buf.is_empty() {
-            let (new_buf, result) = self.not_empty.wait_timeout(buf, timeout).unwrap();
-            buf = new_buf;
-            if result.timed_out() {
+        // 获取锁，如果中毒则返回 None（避免 panic 和进一步中毒）
+        let mut buf = match self.buffer.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                eprintln!("Buffer mutex poisoned, returning None");
                 return None;
             }
+        };
+
+        if buf.is_empty() {
+            // 等待条件变量，如果中毒则返回 None
+            match self.not_empty.wait_timeout(buf, timeout) {
+                Ok((new_buf, wait_result)) => {
+                    buf = new_buf;
+                    if wait_result.timed_out() {
+                        return None;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Condition variable wait poisoned, returning None");
+                    return None;
+                }
+            }
         }
-        let item = buf.pop_front().unwrap();
+
+        // 弹出数据，使用 ? 安全处理（理论上非空，但预防万一）
+        let item = buf.pop_front()?;
         self.total_reads.fetch_add(1, Ordering::Relaxed);
         Some(item)
     }
+
+    /// Non-blocking pop: returns `Some(item)` if available, else `None`.
     pub fn try_pop(&self) -> Option<UnifiedReading> {
         let mut buf = self.buffer.lock().unwrap();
-        buf.pop_front() // 非阻塞pop, 有数据就返回Some，没数据就返回None，
+        buf.pop_front()
     }
+
+    /// Returns a reference to the front item without removing it, or `None` if empty.
     pub fn peek(&self) -> Option<UnifiedReading> {
         let buf = self.buffer.lock().unwrap();
         buf.front().cloned()
